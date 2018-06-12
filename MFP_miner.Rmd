@@ -1,0 +1,613 @@
+---
+title: "MyFitnessPal Miner"
+runtime: shiny
+output: 
+  flexdashboard::flex_dashboard:
+    css: styles.css
+    vertical_layout: fill
+    theme: paper
+    social: [ "twitter", "facebook" ]
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(flexdashboard)
+library(ggplot2)
+library(highcharter)
+library(httr)
+library(parsedate)
+library(wordcloud2)
+library(XML)
+
+source("helpers.R")
+load("example.RData")
+
+```
+
+
+Sidebar {.sidebar}
+======================================================================
+
+```{r}
+
+textInput("user", label = "MyFitnessPal profile (must be public):", placeholder = "username")
+dateInput("from", "From:", value = Sys.Date()-365, min = Sys.Date()-365, max = Sys.Date()-1, 
+          width = "100px")
+dateInput("to", "To:", value = Sys.Date()-1,  width = "100px")
+
+helpText("Note: Date range reflects MFP's access limit to only the last 365 days.")
+fileInput("weight", "Upload weight data (optional)",
+                accept = c(
+                  'text/csv',
+                  'text/comma-separated-values',
+                  'text/tab-separated-values',
+                  'text/plain',
+                  '.csv',
+                  '.tsv'
+                ))
+checkboxInput("header", "file header present", TRUE)
+radioButtons("sep", "file format (comma- or tab-separated)", c(`.csv` = ',', `.tsv` = '\t'), 
+             selected = ',', inline = T)
+br()
+actionButton("go", "Go")
+HTML("&nbsp;&nbsp;&nbsp;")
+actionLink("example", "Try example data")
+
+```
+
+Explore {data-orientation=columns}
+======================================================================
+
+```{r}
+
+code <- isolate(parseQueryString(session$clientData$url_search)$code)
+if(length(code) > 0) HTML("<script>window.location.hash = '#section-gene-diet-interactions';</script>")
+
+```
+
+Column {.tabset .tabset-fade}
+-----------------------------------------------------------------------
+
+```{r}
+
+usr.data <- reactiveValues(food = NULL, weight = NULL, fastfood = NULL)
+
+observeEvent(input$go, {
+    doc <- tryCatch({ parseMFP(input$user, input$from, input$to) 
+            },
+          error = function(e) {
+            return(NULL)
+        })
+    if (is.null(doc)) return(NULL)  
+    status <- paste(xpathApply(doc, "//h1[@class='main-title']", xmlValue))
+    if (length(status) > 0) { 
+       showNotification(paste("Error getting MFP data:", status), 
+                        duration = 5, closeButton = TRUE, type = "error")
+    } else {
+      withProgress(message = "Parsing data...", value = 1/2, {
+        food <- formatMFP(doc)
+        usr.data$food <- food
+        usr.data$fastfood <- food[Brand %in% fastfood$Name, sum(Calories), by = Brand]
+      })
+    }
+})
+
+observeEvent(input$example, {
+  usr.data$food <- example.food
+  usr.data$fastfood <- example.food[Brand %in% fastfood$Name, sum(Calories), by = Brand]
+  usr.data$weight <- example.weight
+})
+
+
+# UI -------------------------------------------------------------------------
+
+tags$div(id = "select-nutrient", 
+         selectInput("nutrient", label = NULL, choices = c("Calories", "Carbs", 
+                      "Fat", "Protein", "Cholest", "Sugars", "Sodium", "Fiber"), 
+                      selected = "Calories"))
+```
+
+### Top 10 Sources
+
+```{r}
+
+## Server ---------------------------------------------------------------------
+output$TopSourcesChart <- renderHighchart({
+  req(usr.data$food)
+  dates <- window$range
+  food <- usr.data$food
+  y <- input$nutrient
+  if (!is.null(dates)) {
+    top <- food[Date %in% as.character(dates), sum(get(y)), by = Foods][order(-V1)][1:10]
+  } else {
+    top <- food[, sum(get(y)), by = Foods][order(-V1)][1:10]
+    dates <- food$Date
+  }
+  highchart() %>% 
+    hc_chart(type = "column") %>%
+    hc_title(text = paste("Top 10 Sources of", y, paste0("(", food.units[[y]], ")" ), 
+                          "from", format(as.Date(first(dates)), "%b %d"), 
+                          "to", format(as.Date(last(dates)), "%b %d") )) %>% 
+    hc_add_series(data = top$V1, name = "Total") %>%
+    hc_xAxis(categories = top$Foods) %>% 
+    hc_legend(enabled = FALSE) %>%
+    hc_add_theme(hc_theme_smpl())
+})   
+
+highchartOutput("TopSourcesChart")
+
+```
+
+### Nutrient Trends
+```{r, fig.height=300}
+
+output$nutrientTrends <- renderHighchart({
+  req(usr.data$food)
+  dates <- window$range
+  food <- usr.data$food
+  y <- input$nutrient
+  if (!is.null(dates)) {
+    food <- food[Date %in% as.character(dates), sum(get(y)), by = Date]
+    Dates <- data.table(Date = as.character(seq.Date(first(window$range), last(window$range), by = 1)))
+    food <- merge(food, Dates, by = c("Date"), all = T)
+  } else {
+    food <- food[, sum(get(y)), by = Date]
+  }
+  food[, Date := as.Date(Date)]
+  n <- 1:length(food$V1)
+  smooth <- predict(loess(food$V1 ~ n))
+  
+  highchart() %>% 
+    hc_chart(type = "line") %>%
+    hc_title(text = paste(y, "from", format(first(food$Date), "%b %d"), 
+                  "to", format(last(food$Date), "%b %d") ))  %>%
+    hc_add_series(data = food$V1, name = y) %>%
+    hc_add_series(data = smooth, name = "Trend line") %>%
+    hc_xAxis(categories = food$Date) %>% 
+    hc_yAxis(title = list(text = paste(y, paste0("(", food.units[[y]], ")")))) %>% 
+    hc_legend(enabled = FALSE) %>%
+    hc_add_theme(hc_theme_smpl())
+})   
+
+highchartOutput("nutrientTrends")
+
+```
+
+
+Column {}
+-----------------------------------------------------------------------
+
+### Weight History
+
+```{r}
+
+## Server ---------------------------------------------------------------------
+
+observeEvent(input$go, {
+  file <- input$weight
+  tmp <- data.table(Date = seq(from = as.Date(input$from), to = as.Date(input$to), by = 1))
+  if (is.null(file)) {
+    # Create empty data.frame with Date but no Weight data column
+    usr.data$weight <- tmp
+  } else {
+    weight <- read.csv(file$datapath, header = input$header, sep = input$sep, 
+                       colClasses = "character")
+    names(weight) <- c("Date", "Weight") 
+    weight$Weight <- as.numeric(weight$Weight)
+    weight$Date <- as.Date(parse_date(weight$Date))
+    weight <- merge(tmp, weight, all = T)
+    weight$Date <- as.character(weight$Date)
+    weight$Impute <- is.na(weight$Weight)
+    weight$Weight <- zoo::na.approx(weight$Weight, rule = 2)
+    usr.data$weight <- weight
+  }
+})
+
+
+window <- reactiveValues(range = NULL)
+  
+output$weightPlot <- renderPlot({
+  req(usr.data$weight)
+  weight <- usr.data$weight
+  weight[, Date := as.Date(Date)]
+  cap <- "Drag and double-click chart to customize time window of data view."
+  if (is.null(weight$Weight)) {
+    weight$Weight <- NA
+    ggplot(weight, aes(x = Date, y = Weight)) + geom_blank() + 
+    labs(title = "- Data not available. -", caption = cap) + 
+    theme_minimal()
+  } else {
+    ggplot(weight, aes(x = Date, y = Weight, color = Impute)) +
+    geom_point(size = 2) + 
+    labs(title = NULL, caption = cap) +
+    scale_color_manual(values=c("black", "red"), 
+                       breaks = TRUE,
+                       labels = "Imputed points for missing data",
+                       guide = guide_legend(title = NULL)) +
+    theme_minimal() +
+    theme(legend.position="bottom")
+  }  
+})
+  
+observeEvent(input$weight_dblclick, {
+  brush <- input$weight_brush
+  if (!is.null(brush)) {
+    window$range <- brushedPoints(usr.data$weight, input$weight_brush)
+    window$range <- window$range[["Date"]]
+  } else {
+    window$range <- NULL
+  }
+})
+
+
+## UI -------------------------------------------------------------------------
+plotOutput("weightPlot", dblclick = "weight_dblclick", 
+             brush = brushOpts(id = "weight_brush", direction = "x", resetOnNew = TRUE))
+
+```
+
+
+Macros {data-orientation=column}
+======================================================================
+
+Column {data-width=800}
+-----------------------------------------------------------------------
+
+### Macros Over Time
+```{r}
+tags$div(id = "macro-scale-rdio-btns",
+  radioButtons("scale", label = NULL, 
+              choices = list("Day", "Week", "Day of week"), selected = "Day", inline = T))
+
+macros <- reactive({
+  req(usr.data$fastfood)
+  food <- usr.data$food
+  macros <- food[, lapply(.SD, sum), by = Date, .SDcols = c("Carbs", "Fat", "Protein", "Calories")]
+  macros[, c("Carbs", "Fat", "Protein") := .(Carbs * 4, Fat * 9, Protein * 4)]
+})
+
+output$macrosT <- renderHighchart({
+  macros <- macros()
+  if(input$scale == "Day") { 
+    macros[, Time := as.character(Date)]
+  } else if (input$scale == "Week") {
+    macros[, Time := as.character(format(as.Date(Date), format = "%U-%Y"))]
+  } else if (input$scale == "Day of week") {
+    macros[, Time := weekdays(as.Date(Date))]
+  }
+  
+  macros <- macros[, lapply(.SD, mean), by = Time, .SDcols = c("Carbs", "Fat", "Protein")]
+  
+  highchart() %>% 
+    hc_chart(type = "column") %>%
+    hc_plotOptions(column = list(stacking = "normal")) %>%
+    hc_title(text = paste("Macro Calories by ", input$scale)) %>% 
+    hc_xAxis(categories = macros$Time) %>% 
+    hc_yAxis(title = list(text = "Calories")) %>% 
+    hc_add_series(name = "Carbs", data = macros$Carbs) %>% 
+    hc_add_series(name = "Fat", data = macros$Fat) %>% 
+    hc_add_series(name = "Protein", data = macros$Protein) %>%
+    hc_add_theme(hc_theme_smpl())
+})
+ 
+tags$div(highchartOutput("macrosT"))
+
+```
+
+Column {data-width=400}
+-----------------------------------------------------------------------
+
+### Macros on Highest v. Lowest Calorie Days
+```{r}
+
+output$macrosLH <- renderHighchart({
+  macros <- macros()
+  quart <- quantile(macros$Calories)
+  low <- macros[Calories < quart["25%"], lapply(.SD, mean), 
+                .SDcols = c("Calories", "Carbs", "Fat", "Protein")]
+  low[, Alcohol := Calories - sum(Carbs, Fat, Protein)]
+  lowC <- round(low$Calories)
+  low <- unlist(low[, lapply(.SD, function(x) x/Calories), 
+                    .SDcols = c("Carbs", "Fat", "Protein", "Alcohol")])
+  low <- round(low * 100)
+  
+  high <- macros[Calories > quart["75%"], lapply(.SD, mean), 
+                 .SDcols = c("Calories", "Carbs", "Fat", "Protein")]
+  high[, Alcohol := Calories - sum(Carbs, Fat, Protein)]
+  highC <- round(high$Calories)
+  high <- unlist(high[, lapply(.SD, function(x) x/Calories), 
+                      .SDcols = c("Carbs", "Fat", "Protein", "Alcohol")])
+  high <- round(high * 100)
+  
+  highchart() %>% 
+  hc_add_series_labels_values(names(high), high, type = "pie", 
+                              name = "Highest Calorie Days",
+                             colorByPoint = TRUE, center = c('50%', '28%'), 
+                             dataLabels = list(distance = 5)) %>% 
+  hc_add_series_labels_values(names(low), low, type = "pie", name = "Lowest Calorie Days",
+                              colorByPoint = TRUE, center = c('50%', '83%'), 
+                              dataLabels = list(distance = 5)) %>% 
+  hc_tooltip(pointFormat = "{point.y}%") %>% 
+  hc_title(text = paste("<h6>Highest Calorie Days, mean of", highC, "</h6>"), 
+           align = "left", useHTML = TRUE, floating = T) %>% 
+  hc_subtitle(text =paste("<h6>Lowest Calorie Days, mean of", lowC, "</h6>"), 
+              align = "left", verticalAlign = "middle", useHTML = TRUE) %>% 
+  hc_credits(enabled = TRUE, text = "*Highest quartile vs lowest quartile") %>% 
+  hc_add_theme(hc_theme_smpl())
+})
+
+highchartOutput("macrosLH")
+
+```
+
+TDEE {data-orientation=columns}
+======================================================================
+
+Column {data-width=175}
+----------------------------------------------------------------------
+
+### Calculator Inputs
+
+```{r}
+
+radioButtons("units", "Units", c("Imperial", "Metric"), selected = "Imperial", inline = TRUE)
+numericInput("height", "Height", value = NA, width = "70px")
+numericInput("weight2", "Weight", value = NA, width = "70px")
+numericInput("age", "Age (yr)", value = NA, min = 18, max = 100, width = "70px")
+radioButtons("sex", "Sex", c("Male", "Female"), selected = "Male", inline = TRUE)
+numericInput("bodyfat", "Body Fat %", value = NA,  width = "70px")
+radioButtons("activity", "Activity level", 
+             c("Little to no exercise" = 1.2, 
+              "Light exercise (1–3 days per week)" = 1.375,
+              "Moderate exercise (3–5 days per week)" = 1.55,
+              "Heavy exercise (6–7 days per week)" = 1.725,
+              "Very heavy exercise (twice per day, extra heavy workouts)" = 1.9), 
+             selected = "Little to no exercise")
+
+observeEvent(input$units, {
+  units <- switch(input$units, 
+                  "Imperial" = list(h = "(in)", w = "(lb)"),
+                  "Metric" = list(h = "(cm)", w = "(kg)"))
+  updateNumericInput(session, "height", label = paste("Height", units$h))
+  updateNumericInput(session, "weight2", label = paste("Weight", units$w))
+})
+
+```
+
+> TDEE (Total Daily Energy Expenditure) is BMR (Basal Metabolic Rate) scaled by activity level. The Mifflin-St Jeor equation is one method of estimating BMR. If you provide body fat %, BMR will also be calculated with the Katch-McArdle Formula. [Details at Wikipedia.](https://en.wikipedia.org/wiki/Basal_metabolic_rate#BMR_estimation_formulas) **Note that predictions apply to adults (> 18yrs) not pregnant or nursing.** 
+
+
+Column
+----------------------------------------------------------------------
+
+### Outputs
+```{r, fig.height=25}
+
+output$MSJ <- renderText({
+  validate(need(!is.na(input$height), "Enter height."), 
+           need(!is.na(input$weight2), "Enter weight."), 
+           need(!is.na(input$age), "Enter age."))
+  hscale <- wscale <- 1
+  if(input$units == "Imperial") {
+    hscale <- 2.54
+    wscale <- 0.453592
+  }
+  sex <- ifelse(input$sex == "Male", 5, -161)
+  BMR <- 10*input$weight2*wscale + 6.25*input$height*hscale - 5*input$age + sex
+  TDEE <- BMR * as.numeric(input$activity)
+  paste("<strong>BMR:</strong>", round(BMR), "<br><strong>TDEE:</strong>", round(TDEE))
+})
+
+output$KM <- renderText({
+  validate(need(!is.na(input$weight2), ""),
+           need(!is.na(input$bodyfat), "Not calculated without body fat input."))
+   wscale <- ifelse(input$units == "Imperial", 0.453592, 1)
+   LBM <- (input$weight2 - input$weight2 * (input$bodyfat/100)) * wscale
+   BMR <- 370 + 21.6*LBM
+   TDEE <- BMR * as.numeric(input$activity)
+   paste("<strong>BMR:</strong>", round(BMR), "<br><strong>TDEE:</strong>", round(TDEE))
+})
+
+tags$div(style = "float: left; width: '500px'; margin-left: 30px; margin-right: 60px;",
+         h6("Mifflin-St Jeor method"),
+         htmlOutput("MSJ"))
+tags$div(style = "float: left; width: '500px';",
+         h6("Katch-McArdle method"),
+         htmlOutput("KM"))
+
+```
+
+### Empirical TDEE
+
+```{r, fig.height=60}
+
+output$empTDEE <- renderHighchart({
+  
+  validate(need(usr.data$weight$Weight, "You'll need to upload weight data to use this."), 
+           need(usr.data$food, "Your MFP data is needed for calculating empirical TDEE"))
+  weight <- usr.data$weight
+  calories <- usr.data$food[, sum(Calories), by = Date][, V1]
+  weight[, Calories := calories]
+  weight[, Interval := rep(1:17, each = 21, length.out = .N)]
+  mean.calories <- round(weight[, mean(Calories), by = Interval][, V1])
+  weight.change <- weight[, delta(Weight), by = Interval ][, V1]
+  mean.deficit <- weight.change * 3500 / 21
+  TDEE <- round(mean.calories - mean.deficit)
+  weight[, TDEE := rep(TDEE, each = 21, length.out = .N)]
+  #paste(TDEE)
+  
+  hc <- highchart() %>% 
+  hc_xAxis(categories = weight$Date) %>% 
+  hc_add_series(name = "Calories", data = weight$Calories, type = "area") %>% 
+  hc_add_series(name = "TDEE", data = weight$TDEE, type = "line") %>% 
+  hc_add_theme(hc_theme_smpl())
+  hc
+})
+
+highchartOutput("empTDEE")
+
+```
+
+> TDEE is computed in 3-week intervals by looking at actual weight change given calorie intake. Areas above the TDEE line represent excess calories that turn into weight gain. TDEE can change over time depending on lifestyle, overall weight, muscle mass, and other factors. 
+
+Fast food {data-orientation=rows}
+======================================================================
+
+Row
+-----------------------------------------------------------------------
+
+### Average calories from fast food for American adult
+```{r}
+valueBox("11.3%", icon = "ion-pizza")
+```
+
+### Your calories from fast food on average
+```{r}
+renderValueBox({
+  req(usr.data$fastfood)
+  food <- usr.data$food
+  ff <- usr.data$fastfood
+  calories <- round(100*(sum(ff$V1)/sum(food$Calories)), digits = 1)
+  valueBox(paste0(calories, "%"), color = ifelse(calories < 11.3, "success", "warning"))
+})
+```
+
+Row
+-----------------------------------------------------------------------
+
+### Where You Get Fast Food (size relative to Calories)
+```{r}
+
+## Server ---------------------------------------------------------------------
+
+output$fastfoodCloud <- renderWordcloud2({
+  req(usr.data$fastfood)
+  wc <- usr.data$fastfood
+  names(wc) <- c("word", "freq")
+  wordcloud2(data = wc, size = 0.8, minSize = 10)
+})
+
+## UI -------------------------------------------------------------------------
+wordcloud2Output("fastfoodCloud")
+
+```
+
+> Diary data visualization based on [this fast food list](https://en.wikipedia.org/w/index.php?title=Category:Fast-food_chains_of_the_United_States). Fast food statistics from 2007-2010 [CDC data](https://www.cdc.gov/nchs/data/databriefs/db114.htm).
+
+
+
+Gene-Diet interactions
+======================================================================
+
+### {.no-title}
+
+<a href="https://api.23andme.com/authorize/?redirect_uri=https://datavu.shinyapps.io/MFP_miner&response_type=code&client_id=5ea3682d6cda2102218b2b4edc061d11&scope=basic%20names%20email%20genomes"><img src="ttam_connect.png"></a>
+
+This module allows you to learn about gene variants that have reported interesting and significant interactions with diet. It is most useful if you have a 23andme account to get your specific profile for most of the SNPs featured here. To authorize, connect using the button above. Note: since this reloads the app, your MFP data will be cleared, and given that none of your data is saved, export any reports first if you wish to have them for personal reference.
+
+Curation of this list is ongoing. Last updated: March 20, 2017.
+
+```{r}
+
+client.id <- "5ea3682d6cda2102218b2b4edc061d11"
+client.secret <- "fdd4a3960ac53630b90f898f871c1e50"
+redirect.uri <- "https://datavu.shinyapps.io/MFP_miner"
+
+output$genetics <- renderTable({
+  
+  if(length(code) > 0) {
+  withProgress(message = "Getting 23andMe data...", value = 0, {
+  token <- POST("https://api.23andme.com/token/", encode = "form",
+                body = list(code = code, client_id = client.id,
+                client_secret = client.secret,
+                redirect_uri = redirect.uri,
+                grant_type = 'authorization_code',
+                scope = "basic names email genomes"))
+  token <- content(token)$access_token
+  H <- paste("Bearer", token)
+  endpoint.id <- GET("https://api.23andme.com/3/account/", add_headers(Authorization = H))
+  profile.id <- content(endpoint.id)$data[[1]]$profiles[[1]]$id
+  marker.urls <- lapply(genexdiet$SNP, function(rs)
+                        paste0("https://api.23andme.com/3/profile/",
+                        profile.id, "/marker/", rs))
+  endpoint.snps <- lapply(marker.urls, function(url) GET(url, add_headers(Authorization = H)))
+  status.200 <- sapply(endpoint.snps, status_code) == 200
+  incProgress(1/2)
+  endpoint.snps <- endpoint.snps[status.200]
+  endpoint.snps <- lapply(endpoint.snps, content)
+  genotype <- lapply(endpoint.snps,
+                     function(x) if(x$is_assayed == TRUE) {
+                       c(rep(x$variants[[1]]$allele, x$variants[[1]]$dosage),
+                         rep(x$variants[[2]]$allele, x$variants[[2]]$dosage)) }
+                     else {
+                       "--" })
+  genotype <- mapply(function(a, ref) {
+    a[a == ref] <- paste0("<span class='match-allele'>", a[a == ref], "</span>")
+    paste0(a, collapse = "") }, genotype, genexdiet[, 3][status.200])
+  genexdiet$`Your genotype:`[status.200] <- genotype
+  })
+  }
+    
+    genexdiet$`Your genotype:`[is.na(genexdiet$`Your genotype:`)] <- "--"
+    genexdiet[, 3] <- paste0("<span class='ref-allele'>", genexdiet[, 3], "</span>")
+    genexdiet
+}, hover = TRUE, sanitize.text.function = function(x) x)
+
+
+tableOutput("genetics")
+
+
+```
+
+> If you are interested in 23andMe to use this tool and to learn more (23andMe has their own genetic weight report and many other reports), using this [referral link](http://refer.23andme.com/v2/share/6393013501472381548) will help support our free app. 
+
+Export data
+======================================================================
+
+```{r}
+
+downloadLink("downloadData", "Export data (.csv)")
+
+output$downloadData <- downloadHandler(
+    filename = "MyFitnessPal_data.csv",
+    content = function(file) { write.csv(usr.data$food[, -c("Brand")], file, row.names = FALSE) }
+  )
+
+helpText("Sample")
+output$table <- renderTable({
+  req(usr.data$food)
+  food <- usr.data$food
+  head(food[, -c("Brand")], 50)
+})
+
+tableOutput("table")
+
+```
+
+About {data-icon="fa-info-circle"}
+======================================================================
+
+**Disclaimer**
+
+All content is for personal educational use only, and is not intended as medical advice or services. Your data is not saved. 
+
+**Learn more**
+
+This app is part of a project called [BYOBio](http://www.byobio.net/) (Bring Your Own Biology). Visit to learn more about the project and access other useful tools.
+
+**Want to drop a question or comment?**
+
+<div class="contact-form">
+<form method="POST" action="https://formspree.io/byobio.project@gmail.com">
+ <div class="form-group">
+  <input type="email" class="form-control" name="email" placeholder="Your email"><br>
+ </div>
+ <div class="form-group">
+  <textarea name="message" class="form-control" placeholder="Questions or feedback..." rows="4"></textarea>
+  <br>
+  <button type="submit" class="btn btn-default">Send</button>
+</div>
+</form>
+</div>
+
+

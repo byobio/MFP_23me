@@ -1,0 +1,28 @@
+#section-sidebar {
+ background-color: GhostWhite;
+}
+
+#select-nutrient {
+  padding-left: 15pt; 
+  padding-top: 5pt;
+}
+
+#macro-scale-rdio-btns {
+  padding-left: 15pt; 
+  padding-top: 5pt;
+}
+
+.match-allele {
+  background-color: yellow;
+}
+
+.ref-allele {
+  font-weight: bold;
+  color: red;
+}
+
+.contact-form {
+  width: 450px; 
+  background-color: GhostWhite; 
+  padding: 5px;
+}
